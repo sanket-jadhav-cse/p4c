@@ -30,6 +30,7 @@ set(LIBP4CTOOLKIT_SRCS
     nethash.cpp
     nullstream.cpp
     options.cpp
+    sarif.cpp
     source_file.cpp
     stringify.cpp
     timer.cpp
@@ -77,6 +78,7 @@ set(LIBP4CTOOLKIT_HDRS
     ordered_set.h
     range.h
     safe_vector.h
+    sarif.h
     set.h
     source_file.h
     sourceCodeBuilder.h

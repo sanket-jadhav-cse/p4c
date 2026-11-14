@@ -29,6 +29,8 @@
 
 namespace P4 {
 
+class SarifWriter;
+
 /// An action to take when a diagnostic message is triggered.
 enum class DiagnosticAction {
     Ignore,  /// Take no action and continue compilation.
@@ -45,6 +47,7 @@ class ErrorReporter {
     bool collectingDiagnostics = false;
     std::vector<Diagnostic> diagnostics;
     std::function<void(const Diagnostic &)> diagnosticConsumer;
+    std::unique_ptr<SarifWriter> sarifWriter;
 
     void publishDiagnostic(Diagnostic diagnostic);
 
@@ -85,7 +88,7 @@ class ErrorReporter {
 
  public:
     ErrorReporter();
-    /// Copy diagnostic state and policy, without sharing consumers.
+    /// Copy diagnostic state and policy, without sharing consumers or file sinks.
     ErrorReporter(const ErrorReporter &other);
     ErrorReporter &operator=(const ErrorReporter &other);
     virtual ~ErrorReporter();
@@ -97,12 +100,15 @@ class ErrorReporter {
     /// Return a copy that remains valid after this reporter/context is destroyed.
     std::vector<Diagnostic> getDiagnostics() const { return diagnostics; }
 
-    /// Optional synchronous observer, invoked after storing a record.
+    /// Optional synchronous observer, invoked after storing and writing a record.
     /// Copy records to retain them; the callback must not reenter this reporter.
     void setDiagnosticConsumer(std::function<void(const Diagnostic &)> consumer) {
         enableDiagnosticCollection();
         diagnosticConsumer = std::move(consumer);
     }
+
+    /// Initialize an optional SARIF adapter; failures are compiler I/O errors.
+    bool setDiagnosticsFile(const std::string &file);
 
     /// Import a diagnostic from an external producer (e.g. GCC). It has already
     /// passed that producer's warning policy. Print/count it without filtering it

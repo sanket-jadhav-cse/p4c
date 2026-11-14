@@ -3,6 +3,10 @@
 
 #include "lib/error_reporter.h"
 
+#include <optional>
+
+#include "lib/sarif.h"
+
 namespace P4 {
 
 ErrorReporter::ErrorReporter()
@@ -25,6 +29,7 @@ ErrorReporter &ErrorReporter::operator=(const ErrorReporter &other) {
     collectingDiagnostics = other.collectingDiagnostics;
     diagnostics = other.diagnostics;
     diagnosticConsumer = {};
+    sarifWriter.reset();
     infoCount = other.infoCount;
     warningCount = other.warningCount;
     errorCount = other.errorCount;
@@ -40,9 +45,31 @@ ErrorReporter &ErrorReporter::operator=(const ErrorReporter &other) {
     return *this;
 }
 
+bool ErrorReporter::setDiagnosticsFile(const std::string &file) {
+    if (sarifWriter && sarifWriter->filename() == file) return true;
+    enableDiagnosticCollection();
+    auto writer = std::make_unique<SarifWriter>(file);
+    if (!writer->write(diagnostics)) {
+        diagnose(DiagnosticAction::Error, "io", "Cannot write diagnostics file %s", "", file);
+        return false;
+    }
+    sarifWriter = std::move(writer);
+    return true;
+}
+
 void ErrorReporter::publishDiagnostic(Diagnostic diagnostic) {
+    auto index = diagnostics.size();
     diagnostics.push_back(std::move(diagnostic));
-    if (diagnosticConsumer) diagnosticConsumer(diagnostics.back());
+    std::optional<std::string> failedFile;
+    if (sarifWriter && !sarifWriter->write(diagnostics)) {
+        failedFile = sarifWriter->filename();
+        // Disable the broken sink before reporting its error, avoiding recursion.
+        sarifWriter.reset();
+    }
+    if (diagnosticConsumer) diagnosticConsumer(diagnostics[index]);
+    if (failedFile)
+        diagnose(DiagnosticAction::Error, "io", "Cannot write diagnostics file %s", "",
+                 *failedFile);
 }
 
 void ErrorReporter::reportDiagnostic(Diagnostic diagnostic) {

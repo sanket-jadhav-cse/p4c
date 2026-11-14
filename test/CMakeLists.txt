@@ -103,3 +103,10 @@ set_tests_properties (gtestp4c PROPERTIES LABELS "gtest")
 add_executable(diagnostic-api-example ${P4C_SOURCE_DIR}/docs/examples/diagnostics.cpp)
 target_link_libraries(diagnostic-api-example ${P4C_LIBRARIES} ${P4C_LIB_DEPS})
 add_test(NAME diagnostic-api-example COMMAND diagnostic-api-example)
+
+if (ENABLE_P4TEST AND ENABLE_BMV2)
+  add_test(NAME structured-diagnostics COMMAND ${PYTHON_EXECUTABLE}
+    ${P4C_SOURCE_DIR}/test/diagnostics/test_diagnostics.py
+    --build-dir ${P4C_BINARY_DIR} --source-dir ${P4C_SOURCE_DIR}
+    --evidence-dir ${P4C_BINARY_DIR}/Testing/StructuredDiagnostics)
+endif()
