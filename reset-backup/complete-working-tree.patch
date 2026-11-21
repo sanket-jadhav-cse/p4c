@@ -1,0 +1,913 @@
+diff --git a/frontends/p4/sideEffects.cpp b/frontends/p4/sideEffects.cpp
+index 34b88e39b3c3b40ebc6aea4a2f33e9bba918e193..fa1ce467c2478d68ed01f1184955b8ce7ab3b15a 100644
+--- a/frontends/p4/sideEffects.cpp
++++ b/frontends/p4/sideEffects.cpp
+@@ -57,12 +57,21 @@ const IR::Node *DoSimplifyExpressions::preorder(IR::Literal *expression) {
+     return expression;
+ }
+ 
++bool DoSimplifyExpressions::hasAssignmentSideEffects() {
++    const Context *ctxt = nullptr;
++    auto assignment = findOrigCtxt<IR::BaseAssignmentStatement>(ctxt);
++    // Save destination indices before RHS calls (including table applications)
++    // can change them. The destination is evaluated first, per P4_16 section 12.1.
++    return assignment && ctxt->child_index == 0 &&
++           SideEffects::check(assignment->right, this, typeMap);
++}
++
+ const IR::Node *DoSimplifyExpressions::preorder(IR::ArrayIndex *expression) {
+     LOG3("Visiting " << dbp(expression));
+     auto type = typeMap->getType(getOriginal(), true);
+     if (SideEffects::check(getOriginal<IR::Expression>(), this, typeMap) ||
+         // if the expression appears as part of an argument also use a temporary for the index
+-        isInContext<IR::Argument>()) {
++        isInContext<IR::Argument>() || hasAssignmentSideEffects()) {
+         visit(expression->left);
+         CHECK_NULL(expression->left);
+         visit(expression->right);
+@@ -97,7 +106,7 @@ const IR::Node *DoSimplifyExpressions::preorder(IR::Member *expression) {
+     const IR::Expression *rv = expression;
+     if (SideEffects::check(getOriginal<IR::Expression>(), this, typeMap) ||
+         // This may be part of a left-value that is passed as an out argument
+-        isInContext<IR::Argument>()) {
++        isInContext<IR::Argument>() || hasAssignmentSideEffects()) {
+         visit(expression->expr);
+         CHECK_NULL(expression->expr);
+ 
+diff --git a/frontends/p4/sideEffects.h b/frontends/p4/sideEffects.h
+index 98b928299067374fd4ff159e84c78c4f3d65324c..4d40c73ef522209019fdd9b0175d35217c5963d1 100644
+--- a/frontends/p4/sideEffects.h
++++ b/frontends/p4/sideEffects.h
+@@ -154,6 +154,7 @@ class DoSimplifyExpressions : public Transform, P4WriteContext, public Resolutio
+     bool mayAlias(const IR::Expression *left, const IR::Expression *right,
+                   const Visitor::Context *ctxt) const;
+     bool containsHeaderType(const IR::Type *type);
++    bool hasAssignmentSideEffects();
+ 
+  public:
+     DoSimplifyExpressions(TypeMap *typeMap, std::set<const IR::Expression *> *added)
+diff --git a/testdata/p4_16_samples/assignment-index-order-bmv2.p4 b/testdata/p4_16_samples/assignment-index-order-bmv2.p4
+new file mode 100644
+index 0000000000000000000000000000000000000000..c99e9d634fec9226716c77f8a00d1905955ba17e
+--- /dev/null
++++ b/testdata/p4_16_samples/assignment-index-order-bmv2.p4
+@@ -0,0 +1,90 @@
++/*
++ * SPDX-FileCopyrightText: NONE
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <core.p4>
++#include <v1model.p4>
++
++header H { bit<8> value; }
++header Result {
++    bit<8> parser_value;
++    bit<8> field_value;
++    bit<8> expression_value;
++    bit<8> slice_value;
++    bit<8> header_value;
++    bit<8> nested_value;
++    bit<8> table_value;
++}
++struct Headers { H[2] stack; Result result; }
++struct Meta {}
++
++bit<8> update(inout bit<8> index, in bit<8> value) {
++    index = 1;
++    return value;
++}
++
++H replace(inout bit<8> index) {
++    index = 1;
++    return (H) { value = 0xa3 };
++}
++
++parser P(packet_in packet, out Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    state start {
++        packet.extract(h.stack[0]);
++        packet.extract(h.stack[1]);
++        index = 0;
++        h.stack[index].value = update(index, 0xa0);
++        h.result.setValid();
++        h.result.parser_value = h.stack[0].value;
++        transition accept;
++    }
++}
++
++control I(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    action advance() { index = 1; }
++    table t {
++        actions = { advance; }
++        const default_action = advance();
++    }
++    apply {
++        // P4_16 section 12.1: save the destination before evaluating the RHS.
++        index = h.stack[1].value & 1;
++        h.stack[index].value = update(index, 0xa1);
++        h.result.field_value = h.stack[0].value;
++
++        index = 0;
++        h.stack[index ^ 1].value = update(index, 0xa2);
++        h.result.expression_value = h.stack[1].value;
++
++        h.stack[0].value = 0x10;
++        index = 0;
++        h.stack[index].value[3:0] = update(index, 0x0b)[3:0];
++        h.result.slice_value = h.stack[0].value;
++
++        index = 0;
++        h.stack[index] = replace(index);
++        h.result.header_value = h.stack[0].value;
++
++        h.stack[0].value = 1;
++        h.stack[1].value = 0;
++        index = 0;
++        h.stack[h.stack[index].value].value = update(index, 0xa4);
++        h.result.nested_value = h.stack[1].value;
++
++        h.stack[0].value = 0;
++        index = 0;
++        h.stack[index].value = t.apply().hit ? 8w0xa5 : 8w0xa6;
++        h.result.table_value = h.stack[0].value;
++        sm.egress_spec = 0;
++    }
++}
++
++control E(inout Headers h, inout Meta m, inout standard_metadata_t sm) { apply {} }
++control V(inout Headers h, inout Meta m) { apply {} }
++control U(inout Headers h, inout Meta m) { apply {} }
++control D(packet_out packet, in Headers h) { apply { packet.emit(h.result); } }
++V1Switch(P(), V(), I(), E(), U(), D()) main;
+diff --git a/testdata/p4_16_samples/assignment-index-order-bmv2.stf b/testdata/p4_16_samples/assignment-index-order-bmv2.stf
+new file mode 100644
+index 0000000000000000000000000000000000000000..05f63d6aab62c571dba4613d1e56ecd64dcbda4c
+--- /dev/null
++++ b/testdata/p4_16_samples/assignment-index-order-bmv2.stf
+@@ -0,0 +1,11 @@
++# SPDX-FileCopyrightText: NONE
++#
++# SPDX-License-Identifier: Apache-2.0
++
++# Parser, field, computed index, slice, whole header, nested index, and table side effects.
++packet 0 1020
++expect 0 a0a1a21ba3a4a6
++
++# Odd second byte selects element 1 in ingress; element 0 must stay unchanged.
++packet 0 1021
++expect 0 a0a0a21ba3a4a6
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4 b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4
+new file mode 100644
+index 0000000000000000000000000000000000000000..c72eba29bf1c2844be46fbda813ab09eddd910de
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4
+@@ -0,0 +1,107 @@
++#include <core.p4>
++#define V1MODEL_VERSION 20180101
++#include <v1model.p4>
++
++header H {
++    bit<8> value;
++}
++
++header Result {
++    bit<8> parser_value;
++    bit<8> field_value;
++    bit<8> expression_value;
++    bit<8> slice_value;
++    bit<8> header_value;
++    bit<8> nested_value;
++    bit<8> table_value;
++}
++
++struct Headers {
++    H[2]   stack;
++    Result result;
++}
++
++struct Meta {
++}
++
++bit<8> update(inout bit<8> index, in bit<8> value) {
++    index = 8w1;
++    return value;
++}
++H replace(inout bit<8> index) {
++    index = 8w1;
++    return (H){value = 8w0xa3};
++}
++parser P(packet_in packet, out Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    state start {
++        packet.extract<H>(h.stack[0]);
++        packet.extract<H>(h.stack[1]);
++        index = 8w0;
++        h.stack[index].value = update(index, 8w0xa0);
++        h.result.setValid();
++        h.result.parser_value = h.stack[0].value;
++        transition accept;
++    }
++}
++
++control I(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    action advance() {
++        index = 8w1;
++    }
++    table t {
++        actions = {
++            advance();
++        }
++        const default_action = advance();
++    }
++    apply {
++        index = h.stack[1].value & 8w1;
++        h.stack[index].value = update(index, 8w0xa1);
++        h.result.field_value = h.stack[0].value;
++        index = 8w0;
++        h.stack[index ^ 8w1].value = update(index, 8w0xa2);
++        h.result.expression_value = h.stack[1].value;
++        h.stack[0].value = 8w0x10;
++        index = 8w0;
++        h.stack[index].value[3:0] = update(index, 8w0xb)[3:0];
++        h.result.slice_value = h.stack[0].value;
++        index = 8w0;
++        h.stack[index] = replace(index);
++        h.result.header_value = h.stack[0].value;
++        h.stack[0].value = 8w1;
++        h.stack[1].value = 8w0;
++        index = 8w0;
++        h.stack[h.stack[index].value].value = update(index, 8w0xa4);
++        h.result.nested_value = h.stack[1].value;
++        h.stack[0].value = 8w0;
++        index = 8w0;
++        h.stack[index].value = (t.apply().hit ? 8w0xa5 : 8w0xa6);
++        h.result.table_value = h.stack[0].value;
++        sm.egress_spec = 9w0;
++    }
++}
++
++control E(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    apply {
++    }
++}
++
++control V(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control U(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control D(packet_out packet, in Headers h) {
++    apply {
++        packet.emit<Result>(h.result);
++    }
++}
++
++V1Switch<Headers, Meta>(P(), V(), I(), E(), U(), D()) main;
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-first.p4.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4 b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4
+new file mode 100644
+index 0000000000000000000000000000000000000000..b46e051883db71b3cf19ab69e46ecbe897d99a8c
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4
+@@ -0,0 +1,159 @@
++#include <core.p4>
++#define V1MODEL_VERSION 20180101
++#include <v1model.p4>
++
++header H {
++    bit<8> value;
++}
++
++header Result {
++    bit<8> parser_value;
++    bit<8> field_value;
++    bit<8> expression_value;
++    bit<8> slice_value;
++    bit<8> header_value;
++    bit<8> nested_value;
++    bit<8> table_value;
++}
++
++struct Headers {
++    H[2]   stack;
++    Result result;
++}
++
++struct Meta {
++}
++
++parser P(packet_in packet, out Headers h, inout Meta m, inout standard_metadata_t sm) {
++    @name("P.index") bit<8> index_8;
++    @name("P.tmp") bit<8> tmp;
++    @name("P.value_0") bit<8> value_5;
++    @name("P.retval") bit<8> retval;
++    @name("P.inlinedRetval") bit<8> inlinedRetval_5;
++    state start {
++        packet.extract<H>(h.stack[0]);
++        packet.extract<H>(h.stack[1]);
++        index_8 = 8w0;
++        tmp = index_8;
++        value_5 = 8w0xa0;
++        retval = value_5;
++        inlinedRetval_5 = retval;
++        h.stack[tmp].value = inlinedRetval_5;
++        h.result.setValid();
++        h.result.parser_value = h.stack[0].value;
++        transition accept;
++    }
++}
++
++control I(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    @name("I.index") bit<8> index_10;
++    @name("I.tmp_0") bit<8> tmp_0;
++    @name("I.tmp_1") bit<8> tmp_1;
++    @name("I.tmp_2") bit<8> tmp_2;
++    @name("I.tmp_3") bit<8> tmp_3;
++    @name("I.tmp_4") bit<8> tmp_4;
++    @name("I.tmp_5") bit<8> tmp_5;
++    @name("I.tmp_6") bit<8> tmp_6;
++    @name("I.tmp_7") bit<8> tmp_7;
++    @name("I.tmp_8") bool tmp_8;
++    @name("I.tmp_9") bit<8> tmp_9;
++    @name("I.value_1") bit<8> value_6;
++    @name("I.retval") bit<8> retval_0;
++    @name("I.inlinedRetval_0") bit<8> inlinedRetval_6;
++    @name("I.value_2") bit<8> value_7;
++    @name("I.retval") bit<8> retval_3;
++    @name("I.inlinedRetval_1") bit<8> inlinedRetval_7;
++    @name("I.value_3") bit<8> value_8;
++    @name("I.retval") bit<8> retval_4;
++    @name("I.inlinedRetval_2") bit<8> inlinedRetval_8;
++    @name("I.retval_0") H retval_5;
++    @name("I.inlinedRetval_3") H inlinedRetval_9;
++    @name("I.value_4") bit<8> value_9;
++    @name("I.retval") bit<8> retval_6;
++    @name("I.inlinedRetval_4") bit<8> inlinedRetval_10;
++    @name("I.advance") action advance_1() {
++    }
++    @name("I.t") table t_0 {
++        actions = {
++            advance_1();
++        }
++        const default_action = advance_1();
++    }
++    apply {
++        index_10 = h.stack[1].value & 8w1;
++        tmp_0 = index_10;
++        value_6 = 8w0xa1;
++        retval_0 = value_6;
++        inlinedRetval_6 = retval_0;
++        h.stack[tmp_0].value = inlinedRetval_6;
++        h.result.field_value = h.stack[0].value;
++        index_10 = 8w0;
++        tmp_1 = index_10 ^ 8w1;
++        value_7 = 8w0xa2;
++        retval_3 = value_7;
++        inlinedRetval_7 = retval_3;
++        h.stack[tmp_1].value = inlinedRetval_7;
++        h.result.expression_value = h.stack[1].value;
++        h.stack[0].value = 8w0x10;
++        index_10 = 8w0;
++        tmp_2 = index_10;
++        value_8 = 8w0xb;
++        retval_4 = value_8;
++        inlinedRetval_8 = retval_4;
++        tmp_3 = inlinedRetval_8;
++        h.stack[tmp_2].value[3:0] = tmp_3[3:0];
++        h.result.slice_value = h.stack[0].value;
++        index_10 = 8w0;
++        tmp_4 = index_10;
++        retval_5.setValid();
++        retval_5 = (H){value = 8w0xa3};
++        inlinedRetval_9 = retval_5;
++        h.stack[tmp_4] = inlinedRetval_9;
++        h.result.header_value = h.stack[0].value;
++        h.stack[0].value = 8w1;
++        h.stack[1].value = 8w0;
++        index_10 = 8w0;
++        tmp_5 = index_10;
++        tmp_6 = h.stack[tmp_5].value;
++        value_9 = 8w0xa4;
++        retval_6 = value_9;
++        inlinedRetval_10 = retval_6;
++        h.stack[tmp_6].value = inlinedRetval_10;
++        h.result.nested_value = h.stack[1].value;
++        h.stack[0].value = 8w0;
++        index_10 = 8w0;
++        tmp_7 = index_10;
++        tmp_8 = t_0.apply().hit;
++        if (tmp_8) {
++            tmp_9 = 8w0xa5;
++        } else {
++            tmp_9 = 8w0xa6;
++        }
++        h.stack[tmp_7].value = tmp_9;
++        h.result.table_value = h.stack[0].value;
++        sm.egress_spec = 9w0;
++    }
++}
++
++control E(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    apply {
++    }
++}
++
++control V(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control U(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control D(packet_out packet, in Headers h) {
++    apply {
++        packet.emit<Result>(h.result);
++    }
++}
++
++V1Switch<Headers, Meta>(P(), V(), I(), E(), U(), D()) main;
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-frontend.p4.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4 b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4
+new file mode 100644
+index 0000000000000000000000000000000000000000..05fd54e991ce3194aa25e4af447a68b785f543ca
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4
+@@ -0,0 +1,191 @@
++#include <core.p4>
++#define V1MODEL_VERSION 20180101
++#include <v1model.p4>
++
++header H {
++    bit<8> value;
++}
++
++header Result {
++    bit<8> parser_value;
++    bit<8> field_value;
++    bit<8> expression_value;
++    bit<8> slice_value;
++    bit<8> header_value;
++    bit<8> nested_value;
++    bit<8> table_value;
++}
++
++struct Headers {
++    H[2]   stack;
++    Result result;
++}
++
++struct Meta {
++}
++
++parser P(packet_in packet, out Headers h, inout Meta m, inout standard_metadata_t sm) {
++    state start {
++        packet.extract<H>(h.stack[0]);
++        packet.extract<H>(h.stack[1]);
++        h.stack[8w0].value = 8w0xa0;
++        h.result.setValid();
++        h.result.parser_value = 8w0xa0;
++        transition accept;
++    }
++}
++
++control I(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    @name("I.tmp_0") bit<8> tmp_0;
++    @name("I.tmp_8") bool tmp_8;
++    @name("I.tmp_9") bit<8> tmp_9;
++    @name("I.retval_0") H retval_5;
++    @name("I.advance") action advance_1() {
++    }
++    @name("I.t") table t_0 {
++        actions = {
++            advance_1();
++        }
++        const default_action = advance_1();
++    }
++    @hidden action assignmentindexorderbmv2l56() {
++        h.stack[8w0].value = 8w0xa1;
++    }
++    @hidden action assignmentindexorderbmv2l56_0() {
++        h.stack[8w1].value = 8w0xa1;
++    }
++    @hidden action assignmentindexorderbmv2l56_1() {
++        tmp_0 = h.stack[1].value & 8w1;
++    }
++    @hidden action assignmentindexorderbmv2l80() {
++        tmp_8 = true;
++    }
++    @hidden action assignmentindexorderbmv2l80_0() {
++        tmp_8 = false;
++    }
++    @hidden action assignmentindexorderbmv2l30() {
++        h.result.field_value = h.stack[0].value;
++        h.stack[8w1].value = 8w0xa2;
++        h.result.expression_value = 8w0xa2;
++        h.stack[0].value = 8w0x10;
++        h.stack[8w0].value[3:0] = 4w0xb;
++        h.result.slice_value = h.stack[0].value;
++        retval_5.setValid();
++        retval_5.value = 8w0xa3;
++        h.stack[8w0] = retval_5;
++        h.result.header_value = h.stack[0].value;
++        h.stack[0].value = 8w1;
++        h.stack[1].value = 8w0;
++        h.stack[8w1].value = 8w0xa4;
++        h.result.nested_value = 8w0xa4;
++        h.stack[0].value = 8w0;
++    }
++    @hidden action assignmentindexorderbmv2l80_1() {
++        tmp_9 = 8w0xa5;
++    }
++    @hidden action assignmentindexorderbmv2l80_2() {
++        tmp_9 = 8w0xa6;
++    }
++    @hidden action assignmentindexorderbmv2l80_3() {
++        h.stack[8w0].value = tmp_9;
++        h.result.table_value = tmp_9;
++        sm.egress_spec = 9w0;
++    }
++    @hidden table tbl_assignmentindexorderbmv2l56 {
++        actions = {
++            assignmentindexorderbmv2l56_1();
++        }
++        const default_action = assignmentindexorderbmv2l56_1();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l56_0 {
++        actions = {
++            assignmentindexorderbmv2l56();
++        }
++        const default_action = assignmentindexorderbmv2l56();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l56_1 {
++        actions = {
++            assignmentindexorderbmv2l56_0();
++        }
++        const default_action = assignmentindexorderbmv2l56_0();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l30 {
++        actions = {
++            assignmentindexorderbmv2l30();
++        }
++        const default_action = assignmentindexorderbmv2l30();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l80 {
++        actions = {
++            assignmentindexorderbmv2l80();
++        }
++        const default_action = assignmentindexorderbmv2l80();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l80_0 {
++        actions = {
++            assignmentindexorderbmv2l80_0();
++        }
++        const default_action = assignmentindexorderbmv2l80_0();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l80_1 {
++        actions = {
++            assignmentindexorderbmv2l80_1();
++        }
++        const default_action = assignmentindexorderbmv2l80_1();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l80_2 {
++        actions = {
++            assignmentindexorderbmv2l80_2();
++        }
++        const default_action = assignmentindexorderbmv2l80_2();
++    }
++    @hidden table tbl_assignmentindexorderbmv2l80_3 {
++        actions = {
++            assignmentindexorderbmv2l80_3();
++        }
++        const default_action = assignmentindexorderbmv2l80_3();
++    }
++    apply {
++        tbl_assignmentindexorderbmv2l56.apply();
++        if (tmp_0 == 8w0) {
++            tbl_assignmentindexorderbmv2l56_0.apply();
++        } else if (tmp_0 == 8w1) {
++            tbl_assignmentindexorderbmv2l56_1.apply();
++        }
++        tbl_assignmentindexorderbmv2l30.apply();
++        if (t_0.apply().hit) {
++            tbl_assignmentindexorderbmv2l80.apply();
++        } else {
++            tbl_assignmentindexorderbmv2l80_0.apply();
++        }
++        if (tmp_8) {
++            tbl_assignmentindexorderbmv2l80_1.apply();
++        } else {
++            tbl_assignmentindexorderbmv2l80_2.apply();
++        }
++        tbl_assignmentindexorderbmv2l80_3.apply();
++    }
++}
++
++control E(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    apply {
++    }
++}
++
++control V(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control U(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control D(packet_out packet, in Headers h) {
++    apply {
++        packet.emit<Result>(h.result);
++    }
++}
++
++V1Switch<Headers, Meta>(P(), V(), I(), E(), U(), D()) main;
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2-midend.p4.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4 b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e1cf2224ad4d28f9a893840343c2f0382bb7e84
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4
+@@ -0,0 +1,107 @@
++#include <core.p4>
++#define V1MODEL_VERSION 20180101
++#include <v1model.p4>
++
++header H {
++    bit<8> value;
++}
++
++header Result {
++    bit<8> parser_value;
++    bit<8> field_value;
++    bit<8> expression_value;
++    bit<8> slice_value;
++    bit<8> header_value;
++    bit<8> nested_value;
++    bit<8> table_value;
++}
++
++struct Headers {
++    H[2]   stack;
++    Result result;
++}
++
++struct Meta {
++}
++
++bit<8> update(inout bit<8> index, in bit<8> value) {
++    index = 1;
++    return value;
++}
++H replace(inout bit<8> index) {
++    index = 1;
++    return (H){value = 0xa3};
++}
++parser P(packet_in packet, out Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    state start {
++        packet.extract(h.stack[0]);
++        packet.extract(h.stack[1]);
++        index = 0;
++        h.stack[index].value = update(index, 0xa0);
++        h.result.setValid();
++        h.result.parser_value = h.stack[0].value;
++        transition accept;
++    }
++}
++
++control I(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    bit<8> index;
++    action advance() {
++        index = 1;
++    }
++    table t {
++        actions = {
++            advance;
++        }
++        const default_action = advance();
++    }
++    apply {
++        index = h.stack[1].value & 1;
++        h.stack[index].value = update(index, 0xa1);
++        h.result.field_value = h.stack[0].value;
++        index = 0;
++        h.stack[index ^ 1].value = update(index, 0xa2);
++        h.result.expression_value = h.stack[1].value;
++        h.stack[0].value = 0x10;
++        index = 0;
++        h.stack[index].value[3:0] = update(index, 0xb)[3:0];
++        h.result.slice_value = h.stack[0].value;
++        index = 0;
++        h.stack[index] = replace(index);
++        h.result.header_value = h.stack[0].value;
++        h.stack[0].value = 1;
++        h.stack[1].value = 0;
++        index = 0;
++        h.stack[h.stack[index].value].value = update(index, 0xa4);
++        h.result.nested_value = h.stack[1].value;
++        h.stack[0].value = 0;
++        index = 0;
++        h.stack[index].value = (t.apply().hit ? 8w0xa5 : 8w0xa6);
++        h.result.table_value = h.stack[0].value;
++        sm.egress_spec = 0;
++    }
++}
++
++control E(inout Headers h, inout Meta m, inout standard_metadata_t sm) {
++    apply {
++    }
++}
++
++control V(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control U(inout Headers h, inout Meta m) {
++    apply {
++    }
++}
++
++control D(packet_out packet, in Headers h) {
++    apply {
++        packet.emit(h.result);
++    }
++}
++
++V1Switch(P(), V(), I(), E(), U(), D()) main;
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4-stderr b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4-stderr
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4-stderr.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4-stderr.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4-stderr.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb
+new file mode 100644
+index 0000000000000000000000000000000000000000..64fb579c6a40677495a0e82b1f5e7e15f142870b
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb
+@@ -0,0 +1,2 @@
++# proto-file: p4/v1/p4runtime.proto
++# proto-message: p4.v1.WriteRequest
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.entries.txtpb.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb
+new file mode 100644
+index 0000000000000000000000000000000000000000..861d60f8ab7ae0ace16b4c2a019f44a3c2d6ac90
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb
+@@ -0,0 +1,30 @@
++# proto-file: p4/config/v1/p4info.proto
++# proto-message: p4.config.v1.P4Info
++
++pkg_info {
++  arch: "v1model"
++}
++tables {
++  preamble {
++    id: 49059515
++    name: "I.t"
++    alias: "t"
++  }
++  action_refs {
++    id: 18790319
++  }
++  const_default_action_id: 18790319
++  initial_default_action {
++    action_id: 18790319
++  }
++  size: 1024
++}
++actions {
++  preamble {
++    id: 18790319
++    name: "I.advance"
++    alias: "advance"
++  }
++}
++type_info {
++}
+diff --git a/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb.license b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb.license
+new file mode 100644
+index 0000000000000000000000000000000000000000..125a3073541a2ae17a1dae50be22f2c0a07a0da2
+--- /dev/null
++++ b/testdata/p4_16_samples_outputs/assignment-index-order-bmv2.p4.p4info.txtpb.license
+@@ -0,0 +1,3 @@
++SPDX-FileCopyrightText: NONE
++
++SPDX-License-Identifier: Apache-2.0
+diff --git a/testdata/p4_16_samples_outputs/side_effects-frontend.p4 b/testdata/p4_16_samples_outputs/side_effects-frontend.p4
+index 6fb6b0eb4a6e453f9b788ab0c37190ec93b3a746..5b9dc60b92579e89d1fb529deca3fd4c57733c11 100644
+--- a/testdata/p4_16_samples_outputs/side_effects-frontend.p4
++++ b/testdata/p4_16_samples_outputs/side_effects-frontend.p4
+@@ -20,6 +20,7 @@ control my(inout H[2] s) {
+     @name("my.tmp_8") bit<1> tmp_8;
+     @name("my.tmp_9") bit<1> tmp_9;
+     @name("my.tmp_10") bit<1> tmp_10;
++    @name("my.tmp_11") bit<1> tmp_11;
+     apply {
+         a_0 = 1w0;
+         tmp = a_0;
+@@ -41,7 +42,8 @@ control my(inout H[2] s) {
+         a_0 = tmp_10;
+         a_0 = g(a_0);
+         a_0 = g(a_0);
+-        s[a_0].z = g(a_0);
++        tmp_11 = a_0;
++        s[tmp_11].z = g(a_0);
+     }
+ }
+ 
+diff --git a/testdata/p4_16_samples_outputs/side_effects-midend.p4 b/testdata/p4_16_samples_outputs/side_effects-midend.p4
+index 3b8fa730d21edcd80ebb71d9d7e89547d35950aa..1bf4fd3c9fafcdd6266c2ff4d1104b5df7701e9a 100644
+--- a/testdata/p4_16_samples_outputs/side_effects-midend.p4
++++ b/testdata/p4_16_samples_outputs/side_effects-midend.p4
+@@ -18,6 +18,7 @@ control my(inout H[2] s) {
+     @name("my.tmp_6") bit<1> tmp_6;
+     @name("my.tmp_8") bit<1> tmp_8;
+     @name("my.tmp_10") bit<1> tmp_10;
++    @name("my.tmp_11") bit<1> tmp_11;
+     @hidden action side_effects21() {
+         tmp_3 = s[1w0].z;
+     }
+@@ -76,6 +77,7 @@ control my(inout H[2] s) {
+         a_0 = tmp_10;
+         a_0 = g(a_0);
+         a_0 = g(a_0);
++        tmp_11 = a_0;
+     }
+     @hidden table tbl_side_effects18 {
+         actions = {
+@@ -209,9 +211,9 @@ control my(inout H[2] s) {
+             tbl_side_effects22_4.apply();
+         }
+         tbl_side_effects22_5.apply();
+-        if (a_0 == 1w0) {
++        if (tmp_11 == 1w0) {
+             tbl_side_effects25.apply();
+-        } else if (a_0 == 1w1) {
++        } else if (tmp_11 == 1w1) {
+             tbl_side_effects25_0.apply();
+         }
+     }
