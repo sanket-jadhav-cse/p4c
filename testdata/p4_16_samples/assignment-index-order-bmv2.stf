@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: NONE
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Parser, field, computed index, slice, whole header, nested index, and table side effects.
+packet 0 1020
+expect 0 a0a1a21ba3a4a6
+
+# Odd second byte selects element 1 in ingress; element 0 must stay unchanged.
+packet 0 1021
+expect 0 a0a0a21ba3a4a6

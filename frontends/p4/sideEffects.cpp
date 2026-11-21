@@ -57,12 +57,21 @@ const IR::Node *DoSimplifyExpressions::preorder(IR::Literal *expression) {
     return expression;
 }
 
+bool DoSimplifyExpressions::hasAssignmentSideEffects() {
+    const Context *ctxt = nullptr;
+    auto assignment = findOrigCtxt<IR::BaseAssignmentStatement>(ctxt);
+    // Save destination indices before RHS calls (including table applications)
+    // can change them. The destination is evaluated first, per P4_16 section 12.1.
+    return assignment && ctxt->child_index == 0 &&
+           SideEffects::check(assignment->right, this, typeMap);
+}
+
 const IR::Node *DoSimplifyExpressions::preorder(IR::ArrayIndex *expression) {
     LOG3("Visiting " << dbp(expression));
     auto type = typeMap->getType(getOriginal(), true);
     if (SideEffects::check(getOriginal<IR::Expression>(), this, typeMap) ||
         // if the expression appears as part of an argument also use a temporary for the index
-        isInContext<IR::Argument>()) {
+        isInContext<IR::Argument>() || hasAssignmentSideEffects()) {
         visit(expression->left);
         CHECK_NULL(expression->left);
         visit(expression->right);
@@ -97,7 +106,7 @@ const IR::Node *DoSimplifyExpressions::preorder(IR::Member *expression) {
     const IR::Expression *rv = expression;
     if (SideEffects::check(getOriginal<IR::Expression>(), this, typeMap) ||
         // This may be part of a left-value that is passed as an out argument
-        isInContext<IR::Argument>()) {
+        isInContext<IR::Argument>() || hasAssignmentSideEffects()) {
         visit(expression->expr);
         CHECK_NULL(expression->expr);
 

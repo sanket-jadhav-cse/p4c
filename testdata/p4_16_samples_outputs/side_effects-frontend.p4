@@ -20,6 +20,7 @@ control my(inout H[2] s) {
     @name("my.tmp_8") bit<1> tmp_8;
     @name("my.tmp_9") bit<1> tmp_9;
     @name("my.tmp_10") bit<1> tmp_10;
+    @name("my.tmp_11") bit<1> tmp_11;
     apply {
         a_0 = 1w0;
         tmp = a_0;
@@ -41,7 +42,8 @@ control my(inout H[2] s) {
         a_0 = tmp_10;
         a_0 = g(a_0);
         a_0 = g(a_0);
-        s[a_0].z = g(a_0);
+        tmp_11 = a_0;
+        s[tmp_11].z = g(a_0);
     }
 }
 

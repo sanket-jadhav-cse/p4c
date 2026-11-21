@@ -18,6 +18,7 @@ control my(inout H[2] s) {
     @name("my.tmp_6") bit<1> tmp_6;
     @name("my.tmp_8") bit<1> tmp_8;
     @name("my.tmp_10") bit<1> tmp_10;
+    @name("my.tmp_11") bit<1> tmp_11;
     @hidden action side_effects21() {
         tmp_3 = s[1w0].z;
     }
@@ -76,6 +77,7 @@ control my(inout H[2] s) {
         a_0 = tmp_10;
         a_0 = g(a_0);
         a_0 = g(a_0);
+        tmp_11 = a_0;
     }
     @hidden table tbl_side_effects18 {
         actions = {
@@ -209,9 +211,9 @@ control my(inout H[2] s) {
             tbl_side_effects22_4.apply();
         }
         tbl_side_effects22_5.apply();
-        if (a_0 == 1w0) {
+        if (tmp_11 == 1w0) {
             tbl_side_effects25.apply();
-        } else if (a_0 == 1w1) {
+        } else if (tmp_11 == 1w1) {
             tbl_side_effects25_0.apply();
         }
     }

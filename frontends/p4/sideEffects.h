@@ -154,6 +154,7 @@ class DoSimplifyExpressions : public Transform, P4WriteContext, public Resolutio
     bool mayAlias(const IR::Expression *left, const IR::Expression *right,
                   const Visitor::Context *ctxt) const;
     bool containsHeaderType(const IR::Type *type);
+    bool hasAssignmentSideEffects();
 
  public:
     DoSimplifyExpressions(TypeMap *typeMap, std::set<const IR::Expression *> *added)
